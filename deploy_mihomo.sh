@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# 版本：v2.1
-# 功能：全自动安装Mihomo + 订阅链接配置 + 系统服务部署
+# 版本：v2.3
+# 功能：全自动安装Mihomo + 订阅链接配置 + 系统服务部署 + 订阅更新
 # 支持：x86_64/arm64/armv7 + CentOS/Debian/Ubuntu/Raspberry Pi OS
 
 # 颜色定义
@@ -10,6 +10,12 @@ GREEN='\033[32m'
 YELLOW='\033[33m'
 BLUE='\033[34m'
 RESET='\033[0m'
+
+# 常量定义
+INSTALL_DIR="/opt/mihomo"
+CONFIG_FILE="${INSTALL_DIR}/config.yaml"
+SERVICE_FILE="/etc/systemd/system/mihomo.service"
+MIHOMO_VERSION="v1.19.12"
 
 # 检查root权限
 if [ "$(id -u)" -ne 0 ]; then
@@ -22,32 +28,63 @@ command_exists() {
     command -v "$1" >/dev/null 2>&1
 }
 
-# 函数：安装依赖
+# 函数：安装依赖（改进版）
 install_dependencies() {
-    echo -e "${BLUE}[1/6] 正在安装系统依赖...${RESET}"
+    echo -e "${BLUE}[1/6] 正在检查系统依赖...${RESET}"
+    
+    # 定义需要检查的依赖
+    local deps=("curl" "gzip" "jq")
+    local missing_deps=()
+    
+    # 检查哪些依赖缺失
+    for dep in "${deps[@]}"; do
+        if ! command_exists "$dep"; then
+            missing_deps+=("$dep")
+        fi
+    done
+    
+    # 如果没有缺失依赖，直接返回
+    if [ ${#missing_deps[@]} -eq 0 ]; then
+        echo -e "${GREEN}所有依赖已安装，跳过依赖安装步骤。${RESET}"
+        return 0
+    fi
+    
+    echo -e "${YELLOW}需要安装的依赖: ${missing_deps[*]}${RESET}"
+    
+    # 安装缺失的依赖
     if command_exists apt-get; then
         apt-get update
-        apt-get install -y curl gzip jq || {
+        if ! apt-get install -y "${missing_deps[@]}"; then
             echo -e "${YELLOW}依赖安装失败，尝试更换阿里云镜像源...${RESET}"
             cp /etc/apt/sources.list /etc/apt/sources.list.bak
             sed -i 's|http://.*archive.ubuntu.com|http://mirrors.aliyun.com|g' /etc/apt/sources.list
             sed -i 's|http://.*security.ubuntu.com|http://mirrors.aliyun.com|g' /etc/apt/sources.list
-            apt-get update && apt-get install -y curl gzip jq
-        }
+            apt-get update && apt-get install -y "${missing_deps[@]}"
+        fi
     elif command_exists yum; then
-        yum install -y curl gzip jq || {
+        if ! yum install -y "${missing_deps[@]}"; then
             echo -e "${YELLOW}依赖安装失败，尝试更换阿里云镜像源...${RESET}"
             if [ -f /etc/yum.repos.d/CentOS-Base.repo ]; then
                 mv /etc/yum.repos.d/CentOS-Base.repo /etc/yum.repos.d/CentOS-Base.repo.bak
             fi
             curl -o /etc/yum.repos.d/CentOS-Base.repo http://mirrors.aliyun.com/repo/Centos-7.repo
             yum clean all && yum makecache
-            yum install -y curl gzip jq
-        }
+            yum install -y "${missing_deps[@]}"
+        fi
     else
         echo -e "${RED}错误：不支持的包管理器！${RESET}"
         exit 1
     fi
+    
+    # 再次验证所有依赖是否安装成功
+    for dep in "${deps[@]}"; do
+        if ! command_exists "$dep"; then
+            echo -e "${RED}错误：依赖 $dep 安装失败！${RESET}"
+            exit 1
+        fi
+    done
+    
+    echo -e "${GREEN}依赖安装完成。${RESET}"
 }
 
 # 函数：检测架构
@@ -95,10 +132,66 @@ download_config() {
     echo -e "${GREEN}订阅配置下载成功！${RESET}"
 }
 
+# 函数：更新订阅配置
+update_subscription() {
+    echo -e "${GREEN}
+=======================================
+Mihomo 订阅更新工具
+=======================================
+${RESET}"
+
+    # 检查配置文件是否存在
+    if [ ! -f "$CONFIG_FILE" ]; then
+        echo -e "${RED}错误：找不到Mihomo配置文件，请先安装Mihomo！${RESET}"
+        exit 1
+    fi
+
+    # 获取新订阅链接
+    echo -e "${YELLOW}请输入您的新订阅链接（支持Clash格式）：${RESET}"
+    read -r NEW_SUB_URL
+    
+    case "$NEW_SUB_URL" in
+        http://*|https://*)
+            # 创建备份
+            BACKUP_FILE="${CONFIG_FILE}.bak_$(date +%Y%m%d%H%M%S)"
+            cp "$CONFIG_FILE" "$BACKUP_FILE"
+            echo -e "${BLUE}已创建配置文件备份: $BACKUP_FILE${RESET}"
+            
+            # 下载新配置
+            if ! curl -L "$NEW_SUB_URL" -o "$CONFIG_FILE"; then
+                echo -e "${RED}错误：订阅链接下载失败！恢复备份...${RESET}"
+                mv "$BACKUP_FILE" "$CONFIG_FILE"
+                exit 1
+            fi
+            
+            # 检查新配置文件是否有效
+            if ! grep -q "proxies:" "$CONFIG_FILE"; then
+                echo -e "${RED}错误：新订阅内容不包含有效代理配置！恢复备份...${RESET}"
+                mv "$BACKUP_FILE" "$CONFIG_FILE"
+                exit 1
+            fi
+            
+            # 重启服务
+            systemctl restart mihomo
+            echo -e "${GREEN}订阅更新成功！Mihomo服务已重启。${RESET}"
+            echo -e "${YELLOW}您可能需要等待1-2分钟让新配置生效。${RESET}"
+            ;;
+        *)
+            echo -e "${RED}错误：订阅链接格式不正确！${RESET}"
+            exit 1
+            ;;
+    esac
+}
+
 # 主安装流程
+if [ "$1" = "--update" ]; then
+    update_subscription
+    exit 0
+fi
+
 echo -e "${GREEN}
 =======================================
-Mihomo 一键安装脚本 (v2.1)
+Mihomo 一键安装脚本 (v2.3)
 =======================================
 ${RESET}"
 
@@ -113,11 +206,6 @@ echo -e "${BLUE}[2/6] 检测到系统架构：${ARCH}${RESET}"
 get_subscription_url
 
 # 步骤4：下载Mihomo
-MIHOMO_VERSION="v1.19.12"
-INSTALL_DIR="/opt/mihomo"
-CONFIG_FILE="${INSTALL_DIR}/config.yaml"
-SERVICE_FILE="/etc/systemd/system/mihomo.service"
-
 echo -e "${BLUE}[4/6] 正在下载Mihomo...${RESET}"
 case "$ARCH" in
     amd64)  BINARY_URL="https://github.com/MetaCubeX/mihomo/releases/download/${MIHOMO_VERSION}/mihomo-linux-amd64-compatible-${MIHOMO_VERSION}.gz" ;;
@@ -174,6 +262,7 @@ $(systemctl status mihomo --no-pager | head -n 5)
 启动服务：systemctl start mihomo
 停止服务：systemctl stop mihomo
 查看日志：journalctl -u mihomo -f
+更新订阅：$0 --update
 
 代理地址：127.0.0.1:7890
 测试代理: curl -I https://www.google.com
